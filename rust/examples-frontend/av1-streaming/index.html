@@ -1,0 +1,88 @@
+<!doctype html>
+<style>
+    body {
+        margin: 0;
+        font-family: sans-serif;
+        background: #1a1a2e;
+        color: #eee;
+    }
+
+    #container {
+        display: flex;
+        flex-direction: column;
+        padding: 16px;
+    }
+
+    figure {
+        margin: 0;
+        width: 50vw;
+    }
+
+    video {
+        max-width: 100%;
+        border-radius: 8px;
+    }
+
+    .previews {
+        display: flex;
+        gap: 16px;
+    }
+
+    .info {
+        padding: 12px 0;
+    }
+
+    button {
+        padding: 6px 16px;
+        border-radius: 4px;
+        border: 1px solid #555;
+        background: #2a2a4a;
+        color: #eee;
+        cursor: pointer;
+    }
+
+    button:hover {
+        background: #3a3a5a;
+    }
+
+    h1 {
+        margin: 0 0 16px 0;
+        font-size: 1.4rem;
+    }
+
+    .codec-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        background: #e94560;
+        border-radius: 4px;
+        font-weight: bold;
+    }
+</style>
+<div id="container">
+    <h1>mediasoup AV1 Streaming</h1>
+    <div class="previews">
+        <figure>
+            <video id="preview-send" muted controls></video>
+            <figcaption>Send preview (local camera)</figcaption>
+        </figure>
+        <figure>
+            <video id="preview-receive" muted controls></video>
+            <figcaption>Receive preview (from SFU via AV1)</figcaption>
+        </figure>
+    </div>
+
+    <div class="info">
+        <p>
+            Video codec: <span id="video-codec" class="codec-badge">?</span>
+            | Scalability mode: <span id="scalability-mode">?</span>
+        </p>
+        <div>
+            SVC Layer control:
+            <button id="decreaseLayer" type="button">- down</button>
+            S<span id="spatial">?</span>T<span id="temporal">?</span>
+            <button id="increaseLayer" type="button">+ up</button>
+        </div>
+    </div>
+</div>
+<script src="dist/bundle.js">
+</script>
