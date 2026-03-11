@@ -192,6 +192,34 @@ let nextWorkerIdx = 0;
 let nextGpuIdx = 0;
 let ssrcCounter = 10000000;
 
+// 이벤트 로그 (119 관제 대시보드용)
+const eventLog = [];
+const MAX_EVENTS = 100;
+let wssRef = null; // WebSocket.Server reference for broadcasting
+
+function addEvent(type, message, data = {}) {
+  const event = {
+    id: Date.now() + '-' + Math.random().toString(36).substr(2, 6),
+    time: new Date().toISOString(),
+    type, // 'stream' | 'recording' | 'client' | 'system'
+    message,
+    ...data,
+  };
+  eventLog.unshift(event);
+  if (eventLog.length > MAX_EVENTS) eventLog.pop();
+
+  // Broadcast to all connected clients
+  if (wssRef) {
+    const payload = JSON.stringify({ action: 'streamEvent', event });
+    wssRef.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    });
+  }
+  return event;
+}
+
 // 모니터링 통계
 const stats = {
   startTime: Date.now(),
@@ -721,6 +749,7 @@ function handleWebSocket(ws) {
 
   stats.totalConnections++;
   stats.activeConnections++;
+  addEvent('client', '클라이언트 접속', { connections: stats.activeConnections });
 
   ws.on('message', async (raw) => {
     let msg;
@@ -827,6 +856,7 @@ function handleWebSocket(ws) {
 
   ws.on('close', () => {
     stats.activeConnections--;
+    addEvent('client', '클라이언트 연결 해제', { connections: stats.activeConnections });
     for (const id of clientConsumerIds) {
       const consumer = consumers.get(id);
       if (consumer) {
@@ -992,6 +1022,11 @@ function createMainServer() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getRecordingsList(streamId)));
 
+    } else if (req.url === '/api/stream-events') {
+      // 이벤트 로그 목록
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(eventLog));
+
     } else if (req.url.startsWith('/recordings/')) {
       // 녹화 파일 직접 서빙 (HLS .m3u8, .ts, .mp4)
       serveRecordingFile(req, res);
@@ -1003,6 +1038,7 @@ function createMainServer() {
   });
 
   const wss = new WebSocket.Server({ server });
+  wssRef = wss;
   wss.on('connection', handleWebSocket);
   return server;
 }
@@ -1256,48 +1292,484 @@ function getViewerHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Drone / CCTV WebRTC Viewer</title>
+<title>119 통합영상관제 시스템</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'Segoe UI',system-ui,sans-serif; background:#0a0e17; color:#eee; }
-  .top-bar { background:#111827; padding:10px 24px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1f2937; }
-  .top-bar h1 { font-size:16px; color:#f0f0f0; }
-  .top-bar a { color:#60a5fa; font-size:13px; text-decoration:none; }
-  .streams { display:grid; grid-template-columns:repeat(auto-fit,minmax(480px,1fr)); gap:12px; padding:16px; }
-  .stream-card { background:#111827; border-radius:10px; overflow:hidden; border:2px solid #1f2937; transition:border-color 0.3s; }
-  .stream-card.active { border-color:#10b981; }
-  .stream-card header { padding:10px 14px; background:#1f2937; display:flex; justify-content:space-between; align-items:center; }
-  .stream-card header h3 { font-size:13px; font-weight:600; }
-  .badge { padding:2px 7px; border-radius:4px; font-size:10px; font-weight:700; }
-  .badge.rtmp { background:#ef4444; color:#fff; }
-  .badge.rtsp { background:#3b82f6; color:#fff; }
-  .badge.codec { background:#10b981; color:#000; }
-  .badge.gpu { background:#7c3aed; color:#fff; }
-  video { width:100%; aspect-ratio:16/9; background:#000; display:block; }
-  .controls { padding:8px 14px; display:flex; gap:8px; align-items:center; }
-  button { padding:5px 14px; border:none; border-radius:6px; cursor:pointer; font-size:12px; font-weight:600; }
-  .btn-watch { background:#10b981; color:#000; }
-  .btn-watch:hover { background:#059669; }
-  .status { font-size:11px; color:#6b7280; margin-left:auto; }
-  #loading { text-align:center; padding:60px; color:#6b7280; }
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--panel:#111827;--panel2:#1a1a2e;--border:#1e293b;--red:#dc2626;--red-light:#ef4444;--amber:#f59e0b;--green:#10b981;--blue:#3b82f6;--purple:#7c3aed;--text:#e5e7eb;--text-dim:#6b7280;--text-muted:#4b5563}
+html,body{height:100%;overflow:hidden}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:13px;display:flex;flex-direction:column}
+
+/* ── Header ── */
+.header{background:linear-gradient(180deg,#1a0000 0%,#0d0d1a 100%);border-bottom:2px solid var(--red);padding:0 16px;height:48px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+.header-logo{display:flex;align-items:center;gap:10px}
+.logo-icon{width:32px;height:32px;background:var(--red);border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.5)}
+.header-title{font-size:16px;font-weight:700;color:#fff;letter-spacing:0.5px}
+.header-sub{font-size:11px;color:var(--red-light);font-weight:600}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:16px}
+.header-clock{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums;color:#fff;letter-spacing:1px}
+.header-date{font-size:11px;color:var(--text-dim)}
+.header-stat{display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,0.05);border-radius:6px;font-size:11px}
+.header-stat .val{font-weight:700;color:#fff}
+.header-btn{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;transition:all 0.2s}
+.header-btn:hover{background:rgba(255,255,255,0.15)}
+.header-btn.active{background:var(--red);border-color:var(--red);color:#fff}
+
+/* ── Main Layout ── */
+.main{flex:1;display:grid;grid-template-columns:220px 1fr 260px;overflow:hidden}
+.main.left-collapsed{grid-template-columns:0px 1fr 260px}
+.main.right-collapsed{grid-template-columns:220px 1fr 0px}
+.main.both-collapsed{grid-template-columns:0px 1fr 0px}
+
+/* ── Left Panel: Stream List ── */
+.left-panel{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.panel-header{padding:10px 12px;background:rgba(255,255,255,0.03);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);flex-shrink:0}
+.panel-header .count{background:var(--red);color:#fff;padding:1px 7px;border-radius:10px;font-size:10px}
+.stream-list{flex:1;overflow-y:auto;padding:6px}
+.stream-list::-webkit-scrollbar{width:4px}
+.stream-list::-webkit-scrollbar-thumb{background:var(--text-muted);border-radius:2px}
+.stream-item{padding:8px 10px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all 0.15s;border:1px solid transparent;margin-bottom:2px}
+.stream-item:hover{background:rgba(255,255,255,0.05);border-color:var(--border)}
+.stream-item.watching{background:rgba(16,185,129,0.1);border-color:var(--green)}
+.stream-item .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.stream-item .dot.live{background:var(--green);box-shadow:0 0 6px var(--green)}
+.stream-item .dot.offline{background:var(--red)}
+.stream-item .info{flex:1;min-width:0}
+.stream-item .name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stream-item .meta{font-size:10px;color:var(--text-dim);margin-top:1px}
+.stream-item .badges{display:flex;gap:3px;flex-shrink:0}
+.sbadge{padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700}
+.sbadge-rtmp{background:rgba(239,68,68,0.2);color:var(--red-light)}
+.sbadge-rtsp{background:rgba(59,130,246,0.2);color:var(--blue)}
+.sbadge-gpu{background:rgba(124,58,237,0.2);color:#a78bfa}
+
+/* ── Center: Video Grid ── */
+.center-panel{display:flex;flex-direction:column;overflow:hidden;background:#050508}
+.grid-toolbar{padding:6px 12px;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-shrink:0}
+.grid-toolbar .label{font-size:11px;color:var(--text-dim);margin-right:4px}
+.layout-btn{width:28px;height:28px;background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:10px;font-weight:700;transition:all 0.15s}
+.layout-btn:hover{border-color:var(--text-dim)}
+.layout-btn.active{background:var(--red);border-color:var(--red);color:#fff}
+.grid-toolbar .sep{width:1px;height:20px;background:var(--border);margin:0 4px}
+.toggle-panel-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 8px;border-radius:4px;cursor:pointer;font-size:10px;transition:all 0.15s}
+.toggle-panel-btn:hover{border-color:var(--text-dim);color:var(--text)}
+
+.video-grid{flex:1;display:grid;gap:2px;padding:2px;overflow:hidden}
+.video-grid.g1x1{grid-template-columns:1fr;grid-template-rows:1fr}
+.video-grid.g2x2{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}
+.video-grid.g3x3{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr}
+.video-grid.g1p5{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr 1fr}
+.video-grid.g1p5 .vcell:first-child{grid-row:1/4}
+
+.vcell{background:#0a0a10;border:1px solid #1a1a2a;border-radius:4px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:0}
+.vcell.active{border-color:var(--green)}
+.vcell.focused{border-color:var(--red);border-width:2px}
+.vcell video{width:100%;height:100%;object-fit:contain;display:block}
+.vcell .overlay{position:absolute;top:0;left:0;right:0;padding:6px 8px;background:linear-gradient(180deg,rgba(0,0,0,0.7) 0%,transparent 100%);display:flex;align-items:center;gap:6px;pointer-events:none;opacity:0;transition:opacity 0.2s}
+.vcell:hover .overlay{opacity:1}
+.vcell.active .overlay{opacity:1}
+.vcell .overlay .live-badge{display:flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:var(--red-light)}
+.vcell .overlay .live-dot{width:6px;height:6px;border-radius:50%;background:var(--red);animation:pulse 1.5s infinite}
+.vcell .overlay .vname{font-size:11px;font-weight:600;color:#fff}
+.vcell .overlay .vinfo{margin-left:auto;font-size:9px;color:rgba(255,255,255,0.6)}
+.vcell .cell-controls{position:absolute;bottom:0;left:0;right:0;padding:6px 8px;background:linear-gradient(0deg,rgba(0,0,0,0.7) 0%,transparent 100%);display:flex;align-items:center;gap:4px;opacity:0;transition:opacity 0.2s}
+.vcell:hover .cell-controls{opacity:1}
+.vcell .cell-btn{background:rgba(255,255,255,0.15);border:none;color:#fff;width:24px;height:24px;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;transition:background 0.15s}
+.vcell .cell-btn:hover{background:rgba(255,255,255,0.3)}
+.vcell .rec-indicator{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;font-size:9px;font-weight:700;color:var(--red-light);opacity:0.9}
+.vcell .rec-dot{width:6px;height:6px;border-radius:50%;background:var(--red);animation:pulse 1s infinite}
+.vcell .empty-label{color:var(--text-muted);font-size:12px;text-align:center;pointer-events:none;user-select:none}
+.vcell .empty-label .num{font-size:24px;font-weight:200;color:var(--text-muted);opacity:0.3}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+
+/* ── Right Panel: Events ── */
+.right-panel{background:var(--panel);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.event-list{flex:1;overflow-y:auto;padding:6px}
+.event-list::-webkit-scrollbar{width:4px}
+.event-list::-webkit-scrollbar-thumb{background:var(--text-muted);border-radius:2px}
+.event-item{padding:6px 8px;border-radius:6px;margin-bottom:2px;display:flex;gap:8px;align-items:flex-start;font-size:11px;transition:background 0.15s}
+.event-item:hover{background:rgba(255,255,255,0.03)}
+.event-item.new{animation:eventFlash 1s ease-out}
+@keyframes eventFlash{0%{background:rgba(220,38,38,0.2)}100%{background:transparent}}
+.event-icon{width:18px;height:18px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10px;flex-shrink:0;margin-top:1px}
+.event-icon.stream{background:rgba(239,68,68,0.15);color:var(--red-light)}
+.event-icon.recording{background:rgba(245,158,11,0.15);color:var(--amber)}
+.event-icon.client{background:rgba(16,185,129,0.15);color:var(--green)}
+.event-icon.system{background:rgba(107,114,128,0.15);color:var(--text-dim)}
+.event-body{flex:1;min-width:0}
+.event-msg{color:var(--text);line-height:1.4}
+.event-time{font-size:9px;color:var(--text-muted);margin-top:1px;font-variant-numeric:tabular-nums}
+
+/* ── Bottom Status Bar ── */
+.status-bar{background:linear-gradient(0deg,#0d0d1a 0%,var(--panel) 100%);border-top:1px solid var(--border);padding:0 16px;height:32px;display:flex;align-items:center;gap:16px;flex-shrink:0;font-size:11px}
+.status-item{display:flex;align-items:center;gap:6px;color:var(--text-dim)}
+.status-item .label{font-size:10px}
+.status-item .value{font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+.mini-bar{width:50px;height:4px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden}
+.mini-bar-fill{height:100%;border-radius:2px;transition:width 0.5s}
+.mini-bar-fill.green{background:var(--green)}
+.mini-bar-fill.yellow{background:var(--amber)}
+.mini-bar-fill.red{background:var(--red)}
+.status-sep{width:1px;height:16px;background:var(--border)}
+.ws-status{display:flex;align-items:center;gap:4px}
+.ws-dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.ws-dot.disconnected{background:var(--red)}
+
+/* ── Responsive ── */
+@media(max-width:1200px){
+  .main{grid-template-columns:180px 1fr 220px}
+}
+@media(max-width:900px){
+  .main{grid-template-columns:1fr !important}
+  .left-panel,.right-panel{display:none}
+}
 </style>
 </head>
 <body>
-<div class="top-bar">
-  <h1>Drone / CCTV - WebRTC Live Viewer</h1>
-  <a href="/monitor">System Monitor</a>
+
+<!-- ═══ HEADER ═══ -->
+<div class="header">
+  <div class="header-logo">
+    <div class="logo-icon">119</div>
+    <div>
+      <div class="header-title">통합영상관제 시스템</div>
+      <div class="header-sub">Integrated Video Control System</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="header-stat">
+      <span class="label">스트림</span>
+      <span class="val" id="h-streams">0</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">접속자</span>
+      <span class="val" id="h-clients">0</span>
+    </div>
+    <div>
+      <div class="header-clock" id="h-clock">--:--:--</div>
+      <div class="header-date" id="h-date">----.--.--</div>
+    </div>
+    <a href="/monitor" class="header-btn">시스템 모니터</a>
+    <button class="header-btn" onclick="toggleFullscreen()" title="전체화면">&#x26F6;</button>
+  </div>
 </div>
-<div id="loading">Connecting...</div>
-<div class="streams" id="streams"></div>
+
+<!-- ═══ MAIN ═══ -->
+<div class="main" id="main-layout">
+
+  <!-- ── Left: Stream List ── -->
+  <div class="left-panel" id="left-panel">
+    <div class="panel-header">
+      <span>영상소스</span>
+      <span class="count" id="stream-count">0</span>
+    </div>
+    <div class="stream-list" id="stream-list"></div>
+  </div>
+
+  <!-- ── Center: Video Grid ── -->
+  <div class="center-panel">
+    <div class="grid-toolbar">
+      <span class="label">레이아웃</span>
+      <button class="layout-btn" data-layout="g1x1" title="1x1">1</button>
+      <button class="layout-btn active" data-layout="g2x2" title="2x2">4</button>
+      <button class="layout-btn" data-layout="g3x3" title="3x3">9</button>
+      <button class="layout-btn" data-layout="g1p5" title="1+5">1+5</button>
+      <div class="sep"></div>
+      <button class="toggle-panel-btn" onclick="togglePanel('left')">◀ 목록</button>
+      <button class="toggle-panel-btn" onclick="togglePanel('right')">이벤트 ▶</button>
+      <div style="flex:1"></div>
+      <button class="header-btn" onclick="watchAll()" title="전체 시청">전체 연결</button>
+    </div>
+    <div class="video-grid g2x2" id="video-grid"></div>
+  </div>
+
+  <!-- ── Right: Event Log ── -->
+  <div class="right-panel" id="right-panel">
+    <div class="panel-header">
+      <span>이벤트 로그</span>
+      <span class="count" id="event-count">0</span>
+    </div>
+    <div class="event-list" id="event-list"></div>
+  </div>
+</div>
+
+<!-- ═══ STATUS BAR ═══ -->
+<div class="status-bar">
+  <div class="ws-status">
+    <div class="ws-dot" id="ws-dot"></div>
+    <span id="ws-label" style="color:var(--text-dim)">연결 중...</span>
+  </div>
+  <div class="status-sep"></div>
+  <div class="status-item">
+    <span class="label">CPU</span>
+    <span class="value" id="sb-cpu">--%</span>
+    <div class="mini-bar"><div class="mini-bar-fill green" id="sb-cpu-bar" style="width:0%"></div></div>
+  </div>
+  <div class="status-item">
+    <span class="label">RAM</span>
+    <span class="value" id="sb-ram">--%</span>
+    <div class="mini-bar"><div class="mini-bar-fill green" id="sb-ram-bar" style="width:0%"></div></div>
+  </div>
+  <div class="status-item">
+    <span class="label">GPU</span>
+    <span class="value" id="sb-gpu">--</span>
+  </div>
+  <div class="status-sep"></div>
+  <div class="status-item">
+    <span class="label">Workers</span>
+    <span class="value" id="sb-workers">--</span>
+  </div>
+  <div class="status-item">
+    <span class="label">녹화</span>
+    <span class="value" id="sb-rec">--</span>
+  </div>
+  <div style="flex:1"></div>
+  <div class="status-item">
+    <span class="label">Uptime</span>
+    <span class="value" id="sb-uptime">--</span>
+  </div>
+</div>
 
 <script>
-const ws = new WebSocket('ws://' + location.host);
+// ═══ State ═══
+const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host);
 let device = null;
 let consumerTransport = null;
-const videoElements = {};
+const streamList = [];
+const gridSlots = {};     // slotIdx → { streamId, videoEl, consumers }
+const watchingStreams = new Set();
+let currentLayout = 'g2x2';
+let maxSlots = 4;
+let focusedSlot = -1;
+const events = [];
 
+// ═══ Clock ═══
+function updateClock() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  document.getElementById('h-clock').textContent = pad(now.getHours())+':'+pad(now.getMinutes())+':'+pad(now.getSeconds());
+  const days = ['일','월','화','수','목','금','토'];
+  document.getElementById('h-date').textContent = now.getFullYear()+'.'+pad(now.getMonth()+1)+'.'+pad(now.getDate())+' ('+days[now.getDay()]+')';
+}
+updateClock();
+setInterval(updateClock, 1000);
+
+// ═══ Layout ═══
+const layoutMap = { g1x1:1, g2x2:4, g3x3:9, g1p5:6 };
+document.querySelectorAll('.layout-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.layout-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    setLayout(btn.dataset.layout);
+  });
+});
+
+function setLayout(layout) {
+  currentLayout = layout;
+  maxSlots = layoutMap[layout];
+  const grid = document.getElementById('video-grid');
+  grid.className = 'video-grid ' + layout;
+  rebuildGrid();
+}
+
+function rebuildGrid() {
+  const grid = document.getElementById('video-grid');
+  const existing = { ...gridSlots };
+  grid.innerHTML = '';
+  // Clear slots beyond maxSlots
+  for (const idx of Object.keys(gridSlots)) {
+    if (parseInt(idx) >= maxSlots) {
+      const slot = gridSlots[idx];
+      if (slot.streamId) watchingStreams.delete(slot.streamId);
+      delete gridSlots[idx];
+    }
+  }
+  for (let i = 0; i < maxSlots; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'vcell';
+    cell.dataset.slot = i;
+    cell.addEventListener('click', () => setFocus(i));
+    if (gridSlots[i] && gridSlots[i].streamId) {
+      const slot = gridSlots[i];
+      cell.classList.add('active');
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      if (slot.mediaStream) { video.srcObject = slot.mediaStream; video.play().catch(()=>{}); }
+      cell.appendChild(video);
+      slot.videoEl = video;
+      // overlay
+      const s = streamList.find(x=>x.id===slot.streamId);
+      cell.innerHTML += '<div class="overlay"><span class="live-badge"><span class="live-dot"></span>LIVE</span><span class="vname">'+(s?s.label:slot.streamId)+'</span><span class="vinfo">'+(s?s.resolution+' '+s.videoCodec:'')+'</span></div>';
+      cell.innerHTML += '<div class="cell-controls"><button class="cell-btn" onclick="event.stopPropagation();captureSnapshot('+i+')" title="스냅샷">&#x1F4F7;</button><button class="cell-btn" onclick="event.stopPropagation();fullscreenCell('+i+')" title="전체화면">&#x26F6;</button><button class="cell-btn" onclick="event.stopPropagation();removeFromGrid('+i+')" title="제거">&#x2715;</button></div>';
+    } else {
+      gridSlots[i] = { streamId: null, videoEl: null, mediaStream: null };
+      cell.innerHTML = '<div class="empty-label"><div class="num">' + (i+1) + '</div>영상 소스를 선택하세요</div>';
+    }
+    if (i === focusedSlot) cell.classList.add('focused');
+    grid.appendChild(cell);
+  }
+  updateStreamListUI();
+}
+
+function setFocus(idx) {
+  focusedSlot = idx;
+  document.querySelectorAll('.vcell').forEach((c,i) => {
+    c.classList.toggle('focused', i===idx);
+  });
+}
+
+// ═══ Panel Toggle ═══
+function togglePanel(side) {
+  const main = document.getElementById('main-layout');
+  if (side === 'left') {
+    document.getElementById('left-panel').style.display =
+      document.getElementById('left-panel').style.display === 'none' ? '' : 'none';
+  } else {
+    document.getElementById('right-panel').style.display =
+      document.getElementById('right-panel').style.display === 'none' ? '' : 'none';
+  }
+}
+
+function toggleFullscreen() {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+  else document.exitFullscreen();
+}
+
+// ═══ Stream List UI ═══
+function updateStreamListUI() {
+  const container = document.getElementById('stream-list');
+  container.innerHTML = '';
+  document.getElementById('stream-count').textContent = streamList.length;
+  document.getElementById('h-streams').textContent = streamList.length;
+  for (const s of streamList) {
+    const item = document.createElement('div');
+    item.className = 'stream-item' + (watchingStreams.has(s.id) ? ' watching' : '');
+    const typeClass = s.type === 'rtmp' ? 'sbadge-rtmp' : 'sbadge-rtsp';
+    item.innerHTML = '<div class="dot live"></div>'
+      + '<div class="info"><div class="name">' + s.label + '</div><div class="meta">' + s.resolution + ' ' + s.fps + 'fps</div></div>'
+      + '<div class="badges"><span class="sbadge ' + typeClass + '">' + s.type.toUpperCase() + '</span>'
+      + (s.gpuId != null ? '<span class="sbadge sbadge-gpu">G'+s.gpuId+'</span>' : '')
+      + '</div>';
+    item.addEventListener('click', () => addToGrid(s.id));
+    container.appendChild(item);
+  }
+}
+
+// ═══ Grid Management ═══
+function addToGrid(streamId) {
+  if (watchingStreams.has(streamId)) return;
+  // Find empty slot
+  let slotIdx = -1;
+  for (let i = 0; i < maxSlots; i++) {
+    if (!gridSlots[i] || !gridSlots[i].streamId) { slotIdx = i; break; }
+  }
+  if (slotIdx === -1) {
+    // Replace focused or last slot
+    slotIdx = focusedSlot >= 0 ? focusedSlot : maxSlots - 1;
+    if (gridSlots[slotIdx]?.streamId) {
+      watchingStreams.delete(gridSlots[slotIdx].streamId);
+    }
+  }
+  gridSlots[slotIdx] = { streamId, videoEl: null, mediaStream: null };
+  watchingStreams.add(streamId);
+  rebuildGrid();
+  watchStream(streamId, slotIdx);
+}
+
+function removeFromGrid(slotIdx) {
+  const slot = gridSlots[slotIdx];
+  if (slot?.streamId) watchingStreams.delete(slot.streamId);
+  gridSlots[slotIdx] = { streamId: null, videoEl: null, mediaStream: null };
+  rebuildGrid();
+}
+
+function watchAll() {
+  const available = streamList.filter(s => !watchingStreams.has(s.id));
+  for (const s of available) {
+    let slotIdx = -1;
+    for (let i = 0; i < maxSlots; i++) {
+      if (!gridSlots[i] || !gridSlots[i].streamId) { slotIdx = i; break; }
+    }
+    if (slotIdx === -1) break;
+    gridSlots[slotIdx] = { streamId: s.id, videoEl: null, mediaStream: null };
+    watchingStreams.add(s.id);
+  }
+  rebuildGrid();
+  for (let i = 0; i < maxSlots; i++) {
+    if (gridSlots[i]?.streamId && !gridSlots[i]?.mediaStream) {
+      watchStream(gridSlots[i].streamId, i);
+    }
+  }
+}
+
+// ═══ Snapshot ═══
+function captureSnapshot(slotIdx) {
+  const slot = gridSlots[slotIdx];
+  if (!slot?.videoEl) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = slot.videoEl.videoWidth;
+  canvas.height = slot.videoEl.videoHeight;
+  canvas.getContext('2d').drawImage(slot.videoEl, 0, 0);
+  const a = document.createElement('a');
+  a.href = canvas.toDataURL('image/png');
+  a.download = (slot.streamId||'capture') + '_' + new Date().toISOString().replace(/[:.]/g,'-') + '.png';
+  a.click();
+  addLocalEvent('system', '스냅샷 저장: ' + (slot.streamId||''));
+}
+
+function fullscreenCell(slotIdx) {
+  const cells = document.querySelectorAll('.vcell');
+  if (cells[slotIdx]) {
+    cells[slotIdx].requestFullscreen().catch(()=>{});
+  }
+}
+
+// ═══ Events ═══
+function addLocalEvent(type, message) {
+  const event = { type, message, time: new Date().toISOString() };
+  events.unshift(event);
+  if (events.length > 50) events.pop();
+  renderEvents();
+}
+
+function renderEvents() {
+  const container = document.getElementById('event-list');
+  const isNew = container.children.length < events.length;
+  container.innerHTML = '';
+  document.getElementById('event-count').textContent = events.length;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const div = document.createElement('div');
+    div.className = 'event-item' + (i === 0 && isNew ? ' new' : '');
+    const iconMap = { stream:'S', recording:'R', client:'C', system:'I' };
+    const t = new Date(e.time);
+    const timeStr = String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0');
+    div.innerHTML = '<div class="event-icon '+(e.type||'system')+'">'+(iconMap[e.type]||'I')+'</div>'
+      + '<div class="event-body"><div class="event-msg">'+e.message+'</div><div class="event-time">'+timeStr+'</div></div>';
+    container.appendChild(div);
+  }
+}
+
+// Load initial events
+fetch('/api/stream-events').then(r=>r.json()).then(list => {
+  for (const e of list) events.push(e);
+  renderEvents();
+}).catch(()=>{});
+
+// ═══ WebSocket ═══
 ws.onopen = () => {
+  document.getElementById('ws-dot').classList.remove('disconnected');
+  document.getElementById('ws-label').textContent = '연결됨';
   ws.send(JSON.stringify({ action: 'getRouterRtpCapabilities' }));
+  addLocalEvent('system', '서버 연결 성공');
+};
+
+ws.onclose = () => {
+  document.getElementById('ws-dot').classList.add('disconnected');
+  document.getElementById('ws-label').textContent = '연결 끊김';
+  addLocalEvent('system', '서버 연결 끊김');
 };
 
 ws.onmessage = async (event) => {
@@ -1311,8 +1783,10 @@ ws.onmessage = async (event) => {
       break;
     }
     case 'streamList': {
-      document.getElementById('loading').style.display = 'none';
-      renderStreams(msg.streams);
+      streamList.length = 0;
+      streamList.push(...msg.streams);
+      updateStreamListUI();
+      rebuildGrid();
       break;
     }
     case 'consumerTransportCreated': {
@@ -1339,47 +1813,96 @@ ws.onmessage = async (event) => {
         ms.addTrack(c.track);
         ws.send(JSON.stringify({ action: 'resumeConsumer', consumerId: ci.id }));
       }
-      const v = videoElements[msg.streamId];
-      if (v) { v.srcObject = ms; v.play(); v.closest('.stream-card').classList.add('active');
-        document.getElementById('st-' + msg.streamId).textContent = 'LIVE'; }
+      // Find slot for this stream
+      for (let i = 0; i < maxSlots; i++) {
+        if (gridSlots[i]?.streamId === msg.streamId) {
+          gridSlots[i].mediaStream = ms;
+          rebuildGrid();
+          break;
+        }
+      }
+      addLocalEvent('stream', '영상 연결: ' + msg.streamId);
+      break;
+    }
+    case 'streamEvent': {
+      addLocalEvent(msg.event.type, msg.event.message);
       break;
     }
   }
 };
 
-function renderStreams(list) {
-  const c = document.getElementById('streams');
-  c.innerHTML = '';
-  for (const s of list) {
-    const d = document.createElement('div');
-    d.className = 'stream-card';
-    d.innerHTML = '<header><h3>' + s.label + '</h3><div>'
-      + '<span class="badge ' + s.type + '">' + s.type.toUpperCase() + '</span> '
-      + '<span class="badge codec">' + s.videoCodec + '</span> '
-      + (s.gpuId !== null ? '<span class="badge gpu">GPU#' + s.gpuId + '</span>' : '')
-      + '</div></header>'
-      + '<video id="v-' + s.id + '" muted playsinline></video>'
-      + '<div class="controls"><button class="btn-watch" onclick="watch(\\'' + s.id + '\\')">Watch</button>'
-      + '<span class="status">' + s.resolution + ' ' + s.fps + 'fps</span>'
-      + '<span class="status" id="st-' + s.id + '">Ready</span></div>';
-    c.appendChild(d);
-    videoElements[s.id] = d.querySelector('video');
-  }
-}
-
-window.watch = async function(sid) {
+async function watchStream(streamId, slotIdx) {
   if (!device) return;
-  document.getElementById('st-' + sid).textContent = 'Connecting...';
   if (!consumerTransport) {
     ws.send(JSON.stringify({ action: 'createConsumerTransport' }));
     await new Promise(r => {
-      const h = (e) => { const m = JSON.parse(e.data);
-        if (m.action === 'consumerTransportCreated') { ws.removeEventListener('message', h); ws.dispatchEvent(new MessageEvent('message',{data:e.data})); setTimeout(r,100); }
-      }; ws.addEventListener('message', h);
+      const h = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.action === 'consumerTransportCreated') {
+          ws.removeEventListener('message', h);
+          ws.dispatchEvent(new MessageEvent('message',{data:e.data}));
+          setTimeout(r, 100);
+        }
+      };
+      ws.addEventListener('message', h);
     });
   }
-  ws.send(JSON.stringify({ action: 'consume', streamId: sid, rtpCapabilities: device.rtpCapabilities }));
-};
+  ws.send(JSON.stringify({ action: 'consume', streamId, rtpCapabilities: device.rtpCapabilities }));
+}
+
+// ═══ Status Bar Polling ═══
+async function updateStatusBar() {
+  try {
+    const res = await fetch('/api/stats');
+    const s = await res.json();
+    const cpuPct = s.cpu.averageUsagePercent;
+    const ramPct = parseFloat(s.memory.usagePercent);
+    document.getElementById('sb-cpu').textContent = cpuPct + '%';
+    document.getElementById('sb-ram').textContent = ramPct.toFixed(0) + '%';
+    setMiniBar('sb-cpu-bar', cpuPct);
+    setMiniBar('sb-ram-bar', ramPct);
+    const gpuText = s.gpu.map(g => g.utilizationPercent + '%/' + g.temperatureC + '\\u00B0').join(' ');
+    document.getElementById('sb-gpu').textContent = gpuText || '--';
+    document.getElementById('sb-workers').textContent = s.mediasoup.aliveWorkers + '/' + s.mediasoup.totalWorkers;
+    document.getElementById('sb-uptime').textContent = s.server.uptimeStr;
+    document.getElementById('h-clients').textContent = s.connections.active;
+    const recCount = s.streams.filter(st => st.running).length;
+    document.getElementById('sb-rec').textContent = recCount + ' 활성';
+  } catch {}
+}
+
+function setMiniBar(id, pct) {
+  const el = document.getElementById(id);
+  el.style.width = Math.min(pct, 100) + '%';
+  el.className = 'mini-bar-fill ' + (pct < 60 ? 'green' : pct < 85 ? 'yellow' : 'red');
+}
+
+updateStatusBar();
+setInterval(updateStatusBar, 3000);
+
+// ═══ Keyboard Shortcuts ═══
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  const num = parseInt(e.key);
+  if (num >= 1 && num <= 9 && num <= streamList.length) {
+    e.preventDefault();
+    addToGrid(streamList[num-1].id);
+  }
+  if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault();
+    if (focusedSlot >= 0) fullscreenCell(focusedSlot);
+  }
+  if (e.key === 'g' || e.key === 'G') {
+    e.preventDefault();
+    const layouts = ['g1x1','g2x2','g3x3','g1p5'];
+    const next = layouts[(layouts.indexOf(currentLayout)+1) % layouts.length];
+    document.querySelectorAll('.layout-btn').forEach(b => b.classList.toggle('active', b.dataset.layout === next));
+    setLayout(next);
+  }
+});
+
+// Init grid
+rebuildGrid();
 </script>
 </body>
 </html>`;
@@ -1404,6 +1927,7 @@ function stopStream(streamId) {
   streams.delete(streamId);
   stats.activeStreams = streams.size;
   console.log(`[${streamId}] Stream stopped`);
+  addEvent('stream', `스트림 중지: ${stream.config.label}`);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -1433,8 +1957,10 @@ async function main() {
     try {
       await ingestStream(streamConfig);
       console.log(`[${streamConfig.id}] Ingestion started`);
+      addEvent('stream', `스트림 시작: ${streamConfig.label} (${streamConfig.type.toUpperCase()})`);
     } catch (error) {
       console.error(`[${streamConfig.id}] Failed:`, error.message);
+      addEvent('stream', `스트림 실패: ${streamConfig.label} - ${error.message}`);
     }
   }
 
