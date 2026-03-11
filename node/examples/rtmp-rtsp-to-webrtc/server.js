@@ -26,6 +26,8 @@ const http = require('http');
 const WebSocket = require('ws');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
 // ─── Server Hardware Configuration ───────────────────────────────────────────
 
@@ -47,9 +49,32 @@ const HARDWARE = {
 
 const config = {
   listenIp: '0.0.0.0',
-  announcedIp: null,       // 운영 시 공인 IP 설정
+  announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || null,
   httpPort: 3000,
-  monitorPort: 3001,       // 모니터링 대시보드 포트
+  monitorPort: 3001,
+
+  // TURN/STUN 서버 설정 (coturn)
+  turn: {
+    enabled: true,
+    host: process.env.TURN_SERVER || process.env.PUBLIC_IP || '127.0.0.1',
+    port: parseInt(process.env.TURN_PORT) || 3478,
+    username: process.env.TURN_USERNAME || 'mediasoup',
+    password: process.env.TURN_PASSWORD || 'mediasoup123',
+  },
+
+  // 녹화 설정
+  recording: {
+    enabled: process.env.RECORDING_ENABLED === 'true',
+    dir: process.env.RECORDING_DIR || '/recordings',
+    // HLS 세그먼트 길이 (초)
+    hlsSegmentDuration: 6,
+    // HLS playlist 유지 세그먼트 수 (0 = 전체 유지)
+    hlsListSize: 0,
+    // MP4 분할 시간 (초, 3600 = 1시간)
+    mp4SegmentDuration: 3600,
+    // 보관 기간 (시간, 0 = 무제한)
+    retentionHours: parseInt(process.env.RECORDING_RETENTION_HOURS) || 168,
+  },
 
   // mediasoup Worker 풀 설정
   // 128코어 중 절반을 mediasoup에, 나머지를 FFmpeg/OS에 할당
@@ -410,6 +435,28 @@ async function ingestStream(streamConfig) {
     console.error(`[${id}] FFmpeg spawn error:`, err.message);
   });
 
+  // ── 녹화 FFmpeg 프로세스 (별도) ──
+  let recordingProc = null;
+  let recordingDir = null;
+  if (config.recording.enabled) {
+    recordingDir = path.join(config.recording.dir, id, new Date().toISOString().replace(/[:.]/g, '-'));
+    fs.mkdirSync(recordingDir, { recursive: true });
+
+    const recArgs = buildRecordingArgs({
+      streamUrl, type, recordingDir,
+      hlsSegmentDuration: config.recording.hlsSegmentDuration,
+      hlsListSize: config.recording.hlsListSize,
+      mp4SegmentDuration: config.recording.mp4SegmentDuration,
+    });
+
+    recordingProc = spawn('ffmpeg', recArgs);
+    recordingProc.stderr.on('data', () => {}); // suppress
+    recordingProc.on('close', (code) => {
+      console.log(`[${id}] Recording FFmpeg exited (code ${code})`);
+    });
+    console.log(`[${id}] Recording to ${recordingDir}`);
+  }
+
   const streamState = {
     config: streamConfig,
     workerIdx,
@@ -419,6 +466,8 @@ async function ingestStream(streamConfig) {
     audioProducer,
     videoProducer,
     ffmpeg: ffmpegProc,
+    recordingProc,
+    recordingDir,
     startTime: Date.now(),
     getStats: () => lastFfmpegStats,
   };
@@ -516,6 +565,69 @@ function buildFfmpegArgs({
   );
 
   return args;
+}
+
+function buildRecordingArgs({ streamUrl, type, recordingDir,
+  hlsSegmentDuration, hlsListSize, mp4SegmentDuration }) {
+  const inputArgs = type === 'rtsp'
+    ? ['-rtsp_transport', 'tcp', '-stimeout', '5000000', '-i', streamUrl]
+    : ['-listen', '1', '-timeout', '30', '-i', streamUrl];
+
+  return [
+    '-fflags', '+genpts',
+    ...inputArgs,
+    // HLS 출력 (라이브 + VOD 재생용)
+    '-c:v', 'copy',       // 원본 코덱 그대로 (트랜스코딩 없음)
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-f', 'hls',
+    '-hls_time', String(hlsSegmentDuration),
+    '-hls_list_size', String(hlsListSize),
+    '-hls_flags', 'delete_segments+append_list',
+    '-hls_segment_filename', path.join(recordingDir, 'seg_%05d.ts'),
+    path.join(recordingDir, 'index.m3u8'),
+    // MP4 분할 녹화 (보관용)
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-f', 'segment',
+    '-segment_time', String(mp4SegmentDuration),
+    '-segment_format', 'mp4',
+    '-reset_timestamps', '1',
+    '-strftime', '1',
+    path.join(recordingDir, 'rec_%Y%m%d_%H%M%S.mp4'),
+  ];
+}
+
+// 녹화 파일 보관 기간 관리
+function cleanupOldRecordings() {
+  if (!config.recording.enabled || config.recording.retentionHours <= 0) return;
+
+  const maxAge = config.recording.retentionHours * 3600 * 1000;
+  const baseDir = config.recording.dir;
+
+  try {
+    if (!fs.existsSync(baseDir)) return;
+    const streamDirs = fs.readdirSync(baseDir);
+    for (const streamId of streamDirs) {
+      const streamPath = path.join(baseDir, streamId);
+      if (!fs.statSync(streamPath).isDirectory()) continue;
+
+      const sessions = fs.readdirSync(streamPath);
+      for (const session of sessions) {
+        const sessionPath = path.join(streamPath, session);
+        if (!fs.statSync(sessionPath).isDirectory()) continue;
+
+        const stat = fs.statSync(sessionPath);
+        if (Date.now() - stat.mtimeMs > maxAge) {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+          console.log(`[Recording] Cleaned up old recording: ${sessionPath}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Recording] Cleanup error:', err.message);
+  }
 }
 
 // ─── WebRTC Consumer Management ──────────────────────────────────────────────
@@ -617,9 +729,27 @@ function handleWebSocket(ws) {
     try {
       switch (msg.action) {
         case 'getRouterRtpCapabilities': {
+          // TURN/STUN 서버 정보도 함께 전달
+          const iceServers = [];
+          if (config.turn.enabled) {
+            iceServers.push(
+              { urls: `stun:${config.turn.host}:${config.turn.port}` },
+              {
+                urls: `turn:${config.turn.host}:${config.turn.port}`,
+                username: config.turn.username,
+                credential: config.turn.password,
+              },
+              {
+                urls: `turn:${config.turn.host}:${config.turn.port}?transport=tcp`,
+                username: config.turn.username,
+                credential: config.turn.password,
+              }
+            );
+          }
           ws.send(JSON.stringify({
             action: 'routerRtpCapabilities',
             rtpCapabilities: routers[workerIdx].rtpCapabilities,
+            iceServers,
           }));
           break;
         }
@@ -849,6 +979,23 @@ function createMainServer() {
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(list));
+
+    // ── 녹화 API ──
+    } else if (req.url === '/api/recordings') {
+      // 전체 녹화 목록
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getRecordingsList()));
+
+    } else if (req.url.startsWith('/api/recordings/')) {
+      // 특정 스트림 녹화 목록
+      const streamId = req.url.split('/')[3];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getRecordingsList(streamId)));
+
+    } else if (req.url.startsWith('/recordings/')) {
+      // 녹화 파일 직접 서빙 (HLS .m3u8, .ts, .mp4)
+      serveRecordingFile(req, res);
+
     } else {
       res.writeHead(404);
       res.end('Not Found');
@@ -858,6 +1005,86 @@ function createMainServer() {
   const wss = new WebSocket.Server({ server });
   wss.on('connection', handleWebSocket);
   return server;
+}
+
+// ─── Recording Helpers ───────────────────────────────────────────────────────
+
+function getRecordingsList(filterStreamId) {
+  const baseDir = config.recording.dir;
+  const result = [];
+
+  try {
+    if (!fs.existsSync(baseDir)) return result;
+    const streamDirs = fs.readdirSync(baseDir);
+
+    for (const streamId of streamDirs) {
+      if (filterStreamId && streamId !== filterStreamId) continue;
+      const streamPath = path.join(baseDir, streamId);
+      if (!fs.statSync(streamPath).isDirectory()) continue;
+
+      const sessions = fs.readdirSync(streamPath).sort().reverse();
+      for (const session of sessions) {
+        const sessionPath = path.join(streamPath, session);
+        if (!fs.statSync(sessionPath).isDirectory()) continue;
+
+        const files = fs.readdirSync(sessionPath);
+        const hlsReady = files.includes('index.m3u8');
+        const mp4Files = files.filter(f => f.endsWith('.mp4'));
+        const stat = fs.statSync(sessionPath);
+
+        result.push({
+          streamId,
+          session,
+          startTime: stat.birthtimeMs || stat.ctimeMs,
+          hlsUrl: hlsReady ? `/recordings/${streamId}/${session}/index.m3u8` : null,
+          mp4Files: mp4Files.map(f => `/recordings/${streamId}/${session}/${f}`),
+          totalFiles: files.length,
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Recording] List error:', err.message);
+  }
+
+  return result;
+}
+
+function serveRecordingFile(req, res) {
+  // /recordings/streamId/session/filename → 파일 서빙
+  const urlPath = decodeURIComponent(req.url);
+  const relPath = urlPath.replace(/^\/recordings\//, '');
+  const filePath = path.join(config.recording.dir, relPath);
+
+  // 경로 탈출 방지
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(path.resolve(config.recording.dir))) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+
+  if (!fs.existsSync(resolved)) {
+    res.writeHead(404);
+    res.end('Not Found');
+    return;
+  }
+
+  const ext = path.extname(resolved).toLowerCase();
+  const mimeTypes = {
+    '.m3u8': 'application/vnd.apple.mpegurl',
+    '.ts': 'video/mp2t',
+    '.mp4': 'video/mp4',
+  };
+  const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+  const stat = fs.statSync(resolved);
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': stat.size,
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': ext === '.m3u8' ? 'no-cache' : 'max-age=3600',
+  });
+  fs.createReadStream(resolved).pipe(res);
 }
 
 // ─── Monitor Dashboard HTML ──────────────────────────────────────────────────
@@ -1165,6 +1392,7 @@ function stopStream(streamId) {
   if (!stream) return;
 
   if (stream.ffmpeg && !stream.ffmpeg.killed) stream.ffmpeg.kill('SIGTERM');
+  if (stream.recordingProc && !stream.recordingProc.killed) stream.recordingProc.kill('SIGTERM');
   stream.audioProducer.close();
   stream.videoProducer.close();
   stream.audioTransport.close();
@@ -1213,6 +1441,19 @@ async function main() {
   console.log('───────────────────────────────────────────────────────────');
   console.log(`Active streams: ${streams.size}`);
   console.log('Ready to serve WebRTC clients');
+
+  // 녹화 디렉토리 생성
+  if (config.recording.enabled) {
+    fs.mkdirSync(config.recording.dir, { recursive: true });
+    console.log(`Recording enabled: ${config.recording.dir}`);
+    // 1시간마다 오래된 녹화 정리
+    setInterval(cleanupOldRecordings, 3600000);
+  }
+
+  // TURN 서버 정보 출력
+  if (config.turn.enabled) {
+    console.log(`TURN/STUN: ${config.turn.host}:${config.turn.port}`);
+  }
 
   // 주기적 상태 로그 (60초마다)
   setInterval(() => {

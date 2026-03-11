@@ -1,18 +1,18 @@
 # ============================================================
-# mediasoup Streaming Server - Docker Compose
+# mediasoup Streaming Server - Docker Compose (Full Stack)
 #
-# 서버 사양:
-#   Intel Xeon Gold 64코어 × 2 / 128GB RAM / NVIDIA A2 × 3
+# 서버: Intel Xeon Gold 64코어×2 / 128GB RAM / NVIDIA A2 ×3
 #
 # 사용법:
-#   docker compose up -d          # 전체 스택 시작
-#   docker compose logs -f app    # 앱 로그
-#   docker compose down           # 전체 중지
+#   bash docker/init-ssl.sh                    # 최초 SSL 인증서 발급
+#   docker compose up -d                       # 기본 (앱+TURN+HTTPS+녹화)
+#   docker compose --profile monitoring up -d  # + Prometheus/Grafana
+#   docker compose logs -f app                 # 앱 로그
+#   docker compose down                        # 전체 중지
 #
-# GPU 사전 요구사항:
-#   - NVIDIA Driver 535+
-#   - NVIDIA Container Toolkit 설치
-#   - docker compose v2.x
+# 사전 요구:
+#   - NVIDIA Driver 535+ / NVIDIA Container Toolkit
+#   - .env 파일에 PUBLIC_IP, DOMAIN 설정
 # ============================================================
 
 services:
@@ -24,65 +24,61 @@ services:
     container_name: mediasoup-streaming
     restart: unless-stopped
 
-    # NVIDIA GPU 전체 패스스루 (A2 × 3)
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all        # GPU 3장 모두 사용
+              count: all
               capabilities: [gpu, video]
 
-    # CPU/메모리 제한 (128코어 중 120코어, 128GB 중 120GB)
     cpus: "120"
     mem_limit: 120g
     memswap_limit: 120g
 
+    # 내부 포트 (nginx가 리버스 프록시)
+    expose:
+      - "3000"
     ports:
-      # HTTP + WebSocket (뷰어 & 모니터링)
-      - "3000:3000"
-      # RTMP 수신 (드론)
-      - "1935:1935"
-      # WebRTC UDP 미디어 포트 범위
-      - "40000-49999:40000-49999/udp"
+      - "1935:1935"                          # RTMP (드론)
+      - "40000-49999:40000-49999/udp"        # WebRTC UDP
 
     environment:
-      # ── Node.js 설정 ──
       - NODE_ENV=production
       - NODE_OPTIONS=--max-old-space-size=8192
       - UV_THREADPOOL_SIZE=128
-      # ── mediasoup 설정 ──
       - MEDIASOUP_LISTEN_IP=0.0.0.0
       - MEDIASOUP_ANNOUNCED_IP=${PUBLIC_IP:-}
       - MEDIASOUP_NUM_WORKERS=64
       - MEDIASOUP_RTC_MIN_PORT=40000
       - MEDIASOUP_RTC_MAX_PORT=49999
-      # ── 스트림 설정 (JSON) ──
       - STREAMS_CONFIG=/app/config/streams.json
+      # TURN
+      - TURN_SERVER=${PUBLIC_IP:-}
+      - TURN_PORT=3478
+      - TURN_USERNAME=${TURN_USERNAME:-mediasoup}
+      - TURN_PASSWORD=${TURN_PASSWORD:-mediasoup123}
+      # 녹화
+      - RECORDING_ENABLED=true
+      - RECORDING_DIR=/recordings
+      - RECORDING_RETENTION_HOURS=${RECORDING_RETENTION_HOURS:-168}
 
     volumes:
-      # 스트림 설정 파일 (호스트에서 관리)
       - ./config:/app/config:ro
-      # 로그 저장
       - streaming-logs:/var/log/mediasoup
-      # Nginx RTMP 녹화 (선택)
       - rtmp-recordings:/var/recordings
+      - recordings:/recordings
 
     ulimits:
       nofile:
         soft: 1000000
         hard: 1000000
-      core:
-        soft: -1
-        hard: -1
 
-    # sysctl (커널 네트워크 최적화)
     sysctls:
       - net.core.rmem_max=8388608
       - net.core.wmem_max=8388608
       - net.core.rmem_default=1048576
       - net.core.wmem_default=1048576
-      - net.ipv4.udp_mem=8388608 12582912 16777216
 
     networks:
       - streaming-net
@@ -100,7 +96,67 @@ services:
       retries: 3
       start_period: 15s
 
-  # ── Prometheus 메트릭 수집 (선택) ───────────────────────────
+  # ── Nginx HTTPS Reverse Proxy ───────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: mediasoup-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx-https.conf:/etc/nginx/templates/default.conf.template:ro
+      - letsencrypt-data:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+      - recordings:/recordings:ro
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - PUBLIC_IP=${PUBLIC_IP:-127.0.0.1}
+    depends_on:
+      - app
+    networks:
+      - streaming-net
+
+  # ── Let's Encrypt 자동 갱신 ─────────────────────────────────
+  certbot:
+    image: certbot/certbot
+    container_name: mediasoup-certbot
+    restart: unless-stopped
+    volumes:
+      - letsencrypt-data:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;'"
+    depends_on:
+      - nginx
+
+  # ── TURN/STUN 서버 (coturn) ─────────────────────────────────
+  coturn:
+    image: coturn/coturn:latest
+    container_name: mediasoup-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./docker/turnserver.conf:/etc/turnserver.conf:ro
+      - letsencrypt-data:/etc/letsencrypt:ro
+    command: >
+      -n
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49152
+      --max-port=65535
+      --realm=${DOMAIN:-streaming.local}
+      --server-name=${DOMAIN:-streaming.local}
+      --lt-cred-mech
+      --user=${TURN_USERNAME:-mediasoup}:${TURN_PASSWORD:-mediasoup123}
+      --external-ip=${PUBLIC_IP:-127.0.0.1}
+      --relay-threads=8
+      --fingerprint
+      --no-cli
+      --no-multicast-peers
+    tmpfs:
+      - /var/tmp
+
+  # ── Prometheus (선택) ───────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
     container_name: mediasoup-prometheus
@@ -115,7 +171,7 @@ services:
     profiles:
       - monitoring
 
-  # ── Grafana 대시보드 (선택) ─────────────────────────────────
+  # ── Grafana (선택) ──────────────────────────────────────────
   grafana:
     image: grafana/grafana:latest
     container_name: mediasoup-grafana
@@ -123,7 +179,7 @@ services:
     ports:
       - "3100:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana-data:/var/lib/grafana
@@ -135,8 +191,11 @@ services:
 volumes:
   streaming-logs:
   rtmp-recordings:
+  recordings:
   prometheus-data:
   grafana-data:
+  letsencrypt-data:
+  certbot-webroot:
 
 networks:
   streaming-net:
