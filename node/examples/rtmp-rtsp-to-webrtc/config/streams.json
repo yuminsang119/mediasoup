@@ -1,0 +1,57 @@
+[
+  {
+    "id": "drone-1",
+    "label": "드론 카메라 1",
+    "type": "rtmp",
+    "url": "rtmp://localhost:1935/live/drone1",
+    "videoCodec": "H264",
+    "hwAccel": true,
+    "resolution": "1920x1080",
+    "fps": 30,
+    "bitrate": "4M"
+  },
+  {
+    "id": "drone-2",
+    "label": "드론 카메라 2",
+    "type": "rtmp",
+    "url": "rtmp://localhost:1935/live/drone2",
+    "videoCodec": "H264",
+    "hwAccel": true,
+    "resolution": "1280x720",
+    "fps": 30,
+    "bitrate": "2M"
+  },
+  {
+    "id": "cctv-1",
+    "label": "CCTV 정문",
+    "type": "rtsp",
+    "url": "rtsp://admin:pass@192.168.1.100:554/stream1",
+    "videoCodec": "H264",
+    "hwAccel": true,
+    "resolution": "1920x1080",
+    "fps": 25,
+    "bitrate": "3M"
+  },
+  {
+    "id": "cctv-2",
+    "label": "CCTV 주차장",
+    "type": "rtsp",
+    "url": "rtsp://admin:pass@192.168.1.101:554/stream1",
+    "videoCodec": "H264",
+    "hwAccel": true,
+    "resolution": "1920x1080",
+    "fps": 25,
+    "bitrate": "3M"
+  },
+  {
+    "id": "cctv-3",
+    "label": "CCTV 로비",
+    "type": "rtsp",
+    "url": "rtsp://admin:pass@192.168.1.102:554/stream1",
+    "videoCodec": "H264",
+    "hwAccel": true,
+    "resolution": "1280x720",
+    "fps": 15,
+    "bitrate": "1.5M"
+  }
+]

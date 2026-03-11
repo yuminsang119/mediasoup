@@ -1,0 +1,143 @@
+# ============================================================
+# mediasoup Streaming Server - Docker Compose
+#
+# 서버 사양:
+#   Intel Xeon Gold 64코어 × 2 / 128GB RAM / NVIDIA A2 × 3
+#
+# 사용법:
+#   docker compose up -d          # 전체 스택 시작
+#   docker compose logs -f app    # 앱 로그
+#   docker compose down           # 전체 중지
+#
+# GPU 사전 요구사항:
+#   - NVIDIA Driver 535+
+#   - NVIDIA Container Toolkit 설치
+#   - docker compose v2.x
+# ============================================================
+
+services:
+  # ── mediasoup 스트리밍 서버 ──────────────────────────────────
+  app:
+    build:
+      context: ../../../
+      dockerfile: node/examples/rtmp-rtsp-to-webrtc/Dockerfile
+    container_name: mediasoup-streaming
+    restart: unless-stopped
+
+    # NVIDIA GPU 전체 패스스루 (A2 × 3)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all        # GPU 3장 모두 사용
+              capabilities: [gpu, video]
+
+    # CPU/메모리 제한 (128코어 중 120코어, 128GB 중 120GB)
+    cpus: "120"
+    mem_limit: 120g
+    memswap_limit: 120g
+
+    ports:
+      # HTTP + WebSocket (뷰어 & 모니터링)
+      - "3000:3000"
+      # RTMP 수신 (드론)
+      - "1935:1935"
+      # WebRTC UDP 미디어 포트 범위
+      - "40000-49999:40000-49999/udp"
+
+    environment:
+      # ── Node.js 설정 ──
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=8192
+      - UV_THREADPOOL_SIZE=128
+      # ── mediasoup 설정 ──
+      - MEDIASOUP_LISTEN_IP=0.0.0.0
+      - MEDIASOUP_ANNOUNCED_IP=${PUBLIC_IP:-}
+      - MEDIASOUP_NUM_WORKERS=64
+      - MEDIASOUP_RTC_MIN_PORT=40000
+      - MEDIASOUP_RTC_MAX_PORT=49999
+      # ── 스트림 설정 (JSON) ──
+      - STREAMS_CONFIG=/app/config/streams.json
+
+    volumes:
+      # 스트림 설정 파일 (호스트에서 관리)
+      - ./config:/app/config:ro
+      # 로그 저장
+      - streaming-logs:/var/log/mediasoup
+      # Nginx RTMP 녹화 (선택)
+      - rtmp-recordings:/var/recordings
+
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+      core:
+        soft: -1
+        hard: -1
+
+    # sysctl (커널 네트워크 최적화)
+    sysctls:
+      - net.core.rmem_max=8388608
+      - net.core.wmem_max=8388608
+      - net.core.rmem_default=1048576
+      - net.core.wmem_default=1048576
+      - net.ipv4.udp_mem=8388608 12582912 16777216
+
+    networks:
+      - streaming-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/stats"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Prometheus 메트릭 수집 (선택) ───────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mediasoup-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - streaming-net
+    profiles:
+      - monitoring
+
+  # ── Grafana 대시보드 (선택) ─────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mediasoup-grafana
+    restart: unless-stopped
+    ports:
+      - "3100:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - streaming-net
+    profiles:
+      - monitoring
+
+volumes:
+  streaming-logs:
+  rtmp-recordings:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  streaming-net:
+    driver: bridge

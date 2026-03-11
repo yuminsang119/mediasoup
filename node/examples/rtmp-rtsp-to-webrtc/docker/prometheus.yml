@@ -1,0 +1,10 @@
+# Prometheus 설정 (monitoring profile 활성화 시 사용)
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'mediasoup-streaming'
+    metrics_path: '/api/stats'
+    static_configs:
+      - targets: ['app:3000']
