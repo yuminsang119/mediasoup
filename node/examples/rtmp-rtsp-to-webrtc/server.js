@@ -1357,12 +1357,15 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .video-grid.g1x1{grid-template-columns:1fr;grid-template-rows:1fr}
 .video-grid.g2x2{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}
 .video-grid.g3x3{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr}
+.video-grid.g4x4{grid-template-columns:1fr 1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr 1fr}
 .video-grid.g1p5{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr 1fr}
 .video-grid.g1p5 .vcell:first-child{grid-row:1/4}
 
 .vcell{background:#0a0a10;border:1px solid #1a1a2a;border-radius:4px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:0}
 .vcell.active{border-color:var(--green)}
 .vcell.focused{border-color:var(--red);border-width:2px}
+.vcell.drag-over{border-color:var(--blue);border-width:2px;background:rgba(59,130,246,0.08)}
+.vcell.dragging{opacity:0.4}
 .vcell video{width:100%;height:100%;object-fit:contain;display:block}
 .vcell .overlay{position:absolute;top:0;left:0;right:0;padding:6px 8px;background:linear-gradient(180deg,rgba(0,0,0,0.7) 0%,transparent 100%);display:flex;align-items:center;gap:6px;pointer-events:none;opacity:0;transition:opacity 0.2s}
 .vcell:hover .overlay{opacity:1}
@@ -1473,6 +1476,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <button class="layout-btn" data-layout="g1x1" title="1x1">1</button>
       <button class="layout-btn active" data-layout="g2x2" title="2x2">4</button>
       <button class="layout-btn" data-layout="g3x3" title="3x3">9</button>
+      <button class="layout-btn" data-layout="g4x4" title="4x4">16</button>
       <button class="layout-btn" data-layout="g1p5" title="1+5">1+5</button>
       <div class="sep"></div>
       <button class="toggle-panel-btn" onclick="togglePanel('left')">◀ 목록</button>
@@ -1541,6 +1545,7 @@ const watchingStreams = new Set();
 let currentLayout = 'g2x2';
 let maxSlots = 4;
 let focusedSlot = -1;
+let dragSrcSlot = -1;
 const events = [];
 
 // ═══ Clock ═══
@@ -1555,7 +1560,7 @@ updateClock();
 setInterval(updateClock, 1000);
 
 // ═══ Layout ═══
-const layoutMap = { g1x1:1, g2x2:4, g3x3:9, g1p5:6 };
+const layoutMap = { g1x1:1, g2x2:4, g3x3:9, g4x4:16, g1p5:6 };
 document.querySelectorAll('.layout-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.layout-btn').forEach(b=>b.classList.remove('active'));
@@ -1589,6 +1594,17 @@ function rebuildGrid() {
     cell.className = 'vcell';
     cell.dataset.slot = i;
     cell.addEventListener('click', () => setFocus(i));
+    // Drag-and-drop support
+    cell.draggable = true;
+    cell.addEventListener('dragstart', (e) => { dragSrcSlot = i; cell.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    cell.addEventListener('dragend', () => { cell.classList.remove('dragging'); document.querySelectorAll('.vcell').forEach(c=>c.classList.remove('drag-over')); });
+    cell.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; cell.classList.add('drag-over'); });
+    cell.addEventListener('dragleave', () => { cell.classList.remove('drag-over'); });
+    cell.addEventListener('drop', (e) => {
+      e.preventDefault(); cell.classList.remove('drag-over');
+      const sid = e.dataTransfer.getData('streamId');
+      if (sid) { dropStreamToSlot(sid, i); } else { swapSlots(dragSrcSlot, i); }
+    });
     if (gridSlots[i] && gridSlots[i].streamId) {
       const slot = gridSlots[i];
       cell.classList.add('active');
@@ -1652,6 +1668,8 @@ function updateStreamListUI() {
       + '<div class="badges"><span class="sbadge ' + typeClass + '">' + s.type.toUpperCase() + '</span>'
       + (s.gpuId != null ? '<span class="sbadge sbadge-gpu">G'+s.gpuId+'</span>' : '')
       + '</div>';
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => { e.dataTransfer.setData('streamId', s.id); e.dataTransfer.effectAllowed = 'copy'; });
     item.addEventListener('click', () => addToGrid(s.id));
     container.appendChild(item);
   }
@@ -1683,6 +1701,24 @@ function removeFromGrid(slotIdx) {
   if (slot?.streamId) watchingStreams.delete(slot.streamId);
   gridSlots[slotIdx] = { streamId: null, videoEl: null, mediaStream: null };
   rebuildGrid();
+}
+
+function dropStreamToSlot(streamId, slotIdx) {
+  if (watchingStreams.has(streamId)) return;
+  if (gridSlots[slotIdx]?.streamId) watchingStreams.delete(gridSlots[slotIdx].streamId);
+  gridSlots[slotIdx] = { streamId, videoEl: null, mediaStream: null };
+  watchingStreams.add(streamId);
+  rebuildGrid();
+  watchStream(streamId, slotIdx);
+}
+
+function swapSlots(fromIdx, toIdx) {
+  if (fromIdx === toIdx || fromIdx < 0) return;
+  const tmp = gridSlots[fromIdx];
+  gridSlots[fromIdx] = gridSlots[toIdx];
+  gridSlots[toIdx] = tmp;
+  rebuildGrid();
+  addLocalEvent('system', '셀 ' + (fromIdx+1) + ' ↔ ' + (toIdx+1) + ' 위치 교환');
 }
 
 function watchAll() {
@@ -1894,7 +1930,7 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.key === 'g' || e.key === 'G') {
     e.preventDefault();
-    const layouts = ['g1x1','g2x2','g3x3','g1p5'];
+    const layouts = ['g1x1','g2x2','g3x3','g4x4','g1p5'];
     const next = layouts[(layouts.indexOf(currentLayout)+1) % layouts.length];
     document.querySelectorAll('.layout-btn').forEach(b => b.classList.toggle('active', b.dataset.layout === next));
     setLayout(next);
