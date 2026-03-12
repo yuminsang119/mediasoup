@@ -847,6 +847,55 @@ function handleWebSocket(ws) {
           ws.send(JSON.stringify({ action: 'serverStats', stats: getMonitoringStats() }));
           break;
         }
+
+        // ── 119 관제 이벤트 시스템 ──
+        case 'createAlert': {
+          const alert = create119Alert(msg.alertType, msg.location, msg.detail, msg.streamId);
+          ws.send(JSON.stringify({ action: 'alertCreated', alert }));
+          break;
+        }
+
+        case 'acknowledgeAlert': {
+          const ack = acknowledgeAlert(msg.alertId);
+          ws.send(JSON.stringify({ action: 'alertAcknowledged', alertId: msg.alertId, success: ack }));
+          break;
+        }
+
+        case 'updateAlertStatus': {
+          const updated = updateAlertStatus(msg.alertId, msg.status);
+          ws.send(JSON.stringify({ action: 'alertStatusUpdated', alertId: msg.alertId, status: msg.status, success: updated }));
+          break;
+        }
+
+        case 'getAlerts': {
+          ws.send(JSON.stringify({ action: 'alertList', alerts: alertLog }));
+          break;
+        }
+
+        // ── PTZ 카메라 제어 ──
+        case 'ptzMove': {
+          const ptzResult = executePtzCommand(msg.streamId, 'move', { pan: msg.pan, tilt: msg.tilt, speed: msg.speed });
+          ws.send(JSON.stringify({ action: 'ptzResult', streamId: msg.streamId, command: 'move', success: ptzResult }));
+          break;
+        }
+
+        case 'ptzZoom': {
+          const ptzResult = executePtzCommand(msg.streamId, 'zoom', { zoom: msg.zoom, speed: msg.speed });
+          ws.send(JSON.stringify({ action: 'ptzResult', streamId: msg.streamId, command: 'zoom', success: ptzResult }));
+          break;
+        }
+
+        case 'ptzStop': {
+          const ptzResult = executePtzCommand(msg.streamId, 'stop', {});
+          ws.send(JSON.stringify({ action: 'ptzResult', streamId: msg.streamId, command: 'stop', success: ptzResult }));
+          break;
+        }
+
+        case 'ptzPreset': {
+          const ptzResult = executePtzCommand(msg.streamId, 'preset', { preset: msg.preset, save: msg.save });
+          ws.send(JSON.stringify({ action: 'ptzResult', streamId: msg.streamId, command: 'preset', success: ptzResult }));
+          break;
+        }
       }
     } catch (error) {
       console.error('WS error:', error.message);
@@ -989,6 +1038,209 @@ function formatUptime(seconds) {
   return `${m}m ${s}s`;
 }
 
+// ─── 119 Alert / Dispatch System ─────────────────────────────────────────────
+
+const alertLog = [];
+const MAX_ALERTS = 200;
+
+const ALERT_TYPES = {
+  fire:     { label: '화재', severity: 'critical', icon: 'F' },
+  rescue:   { label: '구조', severity: 'critical', icon: 'R' },
+  ems:      { label: '구급', severity: 'high',     icon: 'E' },
+  hazmat:   { label: '위험물', severity: 'critical', icon: 'H' },
+  traffic:  { label: '교통사고', severity: 'high',  icon: 'T' },
+  natural:  { label: '자연재해', severity: 'critical', icon: 'N' },
+  falseAlarm: { label: '오보', severity: 'low',     icon: 'X' },
+  general:  { label: '일반', severity: 'info',      icon: 'I' },
+};
+
+const ALERT_STATUSES = ['접수', '출동', '현장도착', '진행중', '상황종료', '복귀'];
+
+function create119Alert(alertType, location, detail, streamId) {
+  const typeInfo = ALERT_TYPES[alertType] || ALERT_TYPES.general;
+  const alert = {
+    id: 'ALT-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
+    type: alertType,
+    typeLabel: typeInfo.label,
+    severity: typeInfo.severity,
+    icon: typeInfo.icon,
+    location: location || '미상',
+    detail: detail || '',
+    streamId: streamId || null,
+    status: '접수',
+    statusHistory: [{ status: '접수', time: new Date().toISOString(), operator: 'system' }],
+    acknowledged: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  alertLog.unshift(alert);
+  if (alertLog.length > MAX_ALERTS) alertLog.pop();
+
+  addEvent('dispatch', `[${typeInfo.label}] ${location} - ${detail || '신고접수'}`, {
+    alertId: alert.id, severity: typeInfo.severity,
+  });
+
+  // Broadcast to all clients
+  if (wssRef) {
+    const payload = JSON.stringify({ action: 'newAlert', alert });
+    wssRef.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    });
+  }
+
+  return alert;
+}
+
+function acknowledgeAlert(alertId) {
+  const alert = alertLog.find(a => a.id === alertId);
+  if (!alert) return false;
+  alert.acknowledged = true;
+  alert.updatedAt = new Date().toISOString();
+  addEvent('dispatch', `알림 확인: ${alert.typeLabel} - ${alert.location}`);
+  broadcastAlertUpdate(alert);
+  return true;
+}
+
+function updateAlertStatus(alertId, newStatus) {
+  const alert = alertLog.find(a => a.id === alertId);
+  if (!alert || !ALERT_STATUSES.includes(newStatus)) return false;
+  alert.status = newStatus;
+  alert.updatedAt = new Date().toISOString();
+  alert.statusHistory.push({ status: newStatus, time: new Date().toISOString(), operator: 'system' });
+
+  const statusEvent = {
+    '출동': 'dispatch', '현장도착': 'dispatch', '진행중': 'dispatch',
+    '상황종료': 'dispatch', '복귀': 'dispatch',
+  };
+  addEvent(statusEvent[newStatus] || 'dispatch', `[${alert.typeLabel}] ${alert.location} → ${newStatus}`, {
+    alertId: alert.id,
+  });
+  broadcastAlertUpdate(alert);
+  return true;
+}
+
+function broadcastAlertUpdate(alert) {
+  if (wssRef) {
+    const payload = JSON.stringify({ action: 'alertUpdated', alert });
+    wssRef.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    });
+  }
+}
+
+// ─── PTZ Camera Control ──────────────────────────────────────────────────────
+
+const ptzState = new Map(); // streamId → { pan, tilt, zoom, presets }
+
+function executePtzCommand(streamId, command, params) {
+  const stream = streams.get(streamId);
+  if (!stream) return false;
+
+  if (!ptzState.has(streamId)) {
+    ptzState.set(streamId, { pan: 0, tilt: 0, zoom: 1, presets: {} });
+  }
+  const state = ptzState.get(streamId);
+
+  switch (command) {
+    case 'move': {
+      state.pan = Math.max(-1, Math.min(1, state.pan + (params.pan || 0)));
+      state.tilt = Math.max(-1, Math.min(1, state.tilt + (params.tilt || 0)));
+      // ONVIF PTZ via FFmpeg or curl (실제 환경에서는 ONVIF 프로토콜 사용)
+      sendPtzToCamera(streamId, stream.config, command, params);
+      addEvent('stream', `PTZ 이동: ${stream.config.label} (P:${params.pan} T:${params.tilt})`);
+      break;
+    }
+    case 'zoom': {
+      state.zoom = Math.max(1, Math.min(20, state.zoom + (params.zoom || 0)));
+      sendPtzToCamera(streamId, stream.config, command, params);
+      addEvent('stream', `PTZ 줌: ${stream.config.label} (${state.zoom.toFixed(1)}x)`);
+      break;
+    }
+    case 'stop': {
+      sendPtzToCamera(streamId, stream.config, command, params);
+      break;
+    }
+    case 'preset': {
+      if (params.save) {
+        state.presets[params.preset] = { pan: state.pan, tilt: state.tilt, zoom: state.zoom };
+        addEvent('stream', `PTZ 프리셋 저장: ${stream.config.label} #${params.preset}`);
+      } else {
+        const p = state.presets[params.preset];
+        if (p) {
+          state.pan = p.pan; state.tilt = p.tilt; state.zoom = p.zoom;
+          sendPtzToCamera(streamId, stream.config, command, params);
+          addEvent('stream', `PTZ 프리셋 호출: ${stream.config.label} #${params.preset}`);
+        }
+      }
+      break;
+    }
+  }
+
+  // Broadcast PTZ state
+  if (wssRef) {
+    const payload = JSON.stringify({ action: 'ptzState', streamId, state: { pan: state.pan, tilt: state.tilt, zoom: state.zoom } });
+    wssRef.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    });
+  }
+  return true;
+}
+
+function sendPtzToCamera(streamId, streamConfig, command, params) {
+  // ONVIF PTZ 프로토콜 연동 (RTSP CCTV)
+  if (streamConfig.type === 'rtsp' && streamConfig.url) {
+    try {
+      const url = new URL(streamConfig.url);
+      const onvifHost = url.hostname;
+      const onvifPort = streamConfig.onvifPort || 80;
+      const user = url.username || 'admin';
+      const pass = url.password || 'admin';
+
+      // ONVIF ContinuousMove SOAP request
+      let soapBody = '';
+      if (command === 'move') {
+        soapBody = `<ContinuousMove xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+          <ProfileToken>Profile_1</ProfileToken>
+          <Velocity><PanTilt x="${params.pan || 0}" y="${params.tilt || 0}" xmlns="http://www.onvif.org/ver10/schema"/>
+          </Velocity></ContinuousMove>`;
+      } else if (command === 'zoom') {
+        soapBody = `<ContinuousMove xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+          <ProfileToken>Profile_1</ProfileToken>
+          <Velocity><Zoom x="${params.zoom || 0}" xmlns="http://www.onvif.org/ver10/schema"/>
+          </Velocity></ContinuousMove>`;
+      } else if (command === 'stop') {
+        soapBody = `<Stop xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+          <ProfileToken>Profile_1</ProfileToken>
+          <PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>`;
+      } else if (command === 'preset' && !params.save) {
+        soapBody = `<GotoPreset xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+          <ProfileToken>Profile_1</ProfileToken>
+          <PresetToken>${params.preset}</PresetToken></GotoPreset>`;
+      }
+
+      if (soapBody) {
+        const envelope = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+<s:Body>${soapBody}</s:Body></s:Envelope>`;
+
+        const curlArgs = [
+          '-s', '--connect-timeout', '2', '-m', '3',
+          '--digest', '--user', `${user}:${pass}`,
+          '-H', 'Content-Type: application/soap+xml; charset=utf-8',
+          '-d', envelope,
+          `http://${onvifHost}:${onvifPort}/onvif/ptz_service`,
+        ];
+        const curl = spawn('curl', curlArgs);
+        curl.on('error', () => {});
+        curl.stderr.on('data', () => {});
+      }
+    } catch (err) {
+      console.error(`[PTZ] ${streamId} ONVIF error:`, err.message);
+    }
+  }
+}
+
 // ─── HTTP Servers ────────────────────────────────────────────────────────────
 
 function createMainServer() {
@@ -1026,6 +1278,10 @@ function createMainServer() {
       // 이벤트 로그 목록
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(eventLog));
+
+    } else if (req.url === '/api/alerts') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(alertLog));
 
     } else if (req.url.startsWith('/recordings/')) {
       // 녹화 파일 직접 서빙 (HLS .m3u8, .ts, .mp4)
@@ -1399,6 +1655,51 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .event-icon.recording{background:rgba(245,158,11,0.15);color:var(--amber)}
 .event-icon.client{background:rgba(16,185,129,0.15);color:var(--green)}
 .event-icon.system{background:rgba(107,114,128,0.15);color:var(--text-dim)}
+.event-icon.dispatch{background:rgba(220,38,38,0.2);color:var(--red-light)}
+
+/* ── Alert Panel ── */
+.alert-section{border-bottom:1px solid var(--border);flex-shrink:0}
+.alert-list{max-height:200px;overflow-y:auto;padding:4px 6px}
+.alert-item{padding:6px 8px;border-radius:6px;margin-bottom:3px;border-left:3px solid transparent;display:flex;gap:6px;align-items:flex-start;font-size:11px;cursor:pointer;transition:background 0.15s}
+.alert-item:hover{background:rgba(255,255,255,0.04)}
+.alert-item.severity-critical{border-left-color:var(--red);background:rgba(220,38,38,0.06)}
+.alert-item.severity-high{border-left-color:var(--amber);background:rgba(245,158,11,0.04)}
+.alert-item.severity-low{border-left-color:var(--blue)}
+.alert-item.severity-info{border-left-color:var(--text-muted)}
+.alert-item.unack{animation:alertPulse 2s infinite}
+@keyframes alertPulse{0%,100%{opacity:1}50%{opacity:0.7}}
+.alert-type{font-weight:700;font-size:10px;padding:1px 5px;border-radius:3px;flex-shrink:0}
+.alert-type.fire{background:rgba(220,38,38,0.3);color:#ff6b6b}
+.alert-type.rescue{background:rgba(245,158,11,0.3);color:#fbbf24}
+.alert-type.ems{background:rgba(16,185,129,0.3);color:#34d399}
+.alert-type.hazmat{background:rgba(124,58,237,0.3);color:#a78bfa}
+.alert-type.traffic{background:rgba(59,130,246,0.3);color:#60a5fa}
+.alert-body{flex:1;min-width:0}
+.alert-loc{font-weight:600;color:var(--text)}
+.alert-detail{font-size:10px;color:var(--text-dim);margin-top:1px}
+.alert-status{font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.08);color:var(--text-dim);flex-shrink:0}
+.alert-status.active{background:rgba(220,38,38,0.2);color:var(--red-light)}
+.alert-ack-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:9px}
+.alert-ack-btn:hover{border-color:var(--green);color:var(--green)}
+
+/* ── PTZ Controls ── */
+.ptz-overlay{position:absolute;bottom:36px;right:8px;display:none;z-index:10}
+.vcell.focused .ptz-overlay,.vcell:hover .ptz-overlay{display:block}
+.ptz-pad{background:rgba(0,0,0,0.7);border:1px solid rgba(255,255,255,0.15);border-radius:50%;width:100px;height:100px;position:relative}
+.ptz-btn{position:absolute;background:rgba(255,255,255,0.1);border:none;color:#fff;cursor:pointer;border-radius:4px;font-size:14px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;transition:background 0.15s}
+.ptz-btn:hover{background:rgba(255,255,255,0.3)}
+.ptz-btn:active{background:var(--blue)}
+.ptz-up{top:2px;left:50%;transform:translateX(-50%)}
+.ptz-down{bottom:2px;left:50%;transform:translateX(-50%)}
+.ptz-left{left:2px;top:50%;transform:translateY(-50%)}
+.ptz-right{right:2px;top:50%;transform:translateY(-50%)}
+.ptz-center{top:50%;left:50%;transform:translate(-50%,-50%);border-radius:50%;width:22px;height:22px;font-size:10px}
+.ptz-zoom{display:flex;gap:4px;justify-content:center;margin-top:4px}
+.ptz-zoom-btn{background:rgba(0,0,0,0.7);border:1px solid rgba(255,255,255,0.15);color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700}
+.ptz-zoom-btn:hover{background:rgba(255,255,255,0.2)}
+.ptz-presets{display:flex;gap:3px;justify-content:center;margin-top:4px}
+.ptz-preset-btn{background:rgba(0,0,0,0.7);border:1px solid rgba(255,255,255,0.15);color:#ccc;padding:2px 6px;border-radius:3px;cursor:pointer;font-size:9px}
+.ptz-preset-btn:hover{background:rgba(255,255,255,0.2);color:#fff}
 .event-body{flex:1;min-width:0}
 .event-msg{color:var(--text);line-height:1.4}
 .event-time{font-size:9px;color:var(--text-muted);margin-top:1px;font-variant-numeric:tabular-nums}
@@ -1487,8 +1788,15 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
     <div class="video-grid g2x2" id="video-grid"></div>
   </div>
 
-  <!-- ── Right: Event Log ── -->
+  <!-- ── Right: Alerts + Event Log ── -->
   <div class="right-panel" id="right-panel">
+    <div class="alert-section">
+      <div class="panel-header">
+        <span>119 신고현황</span>
+        <span class="count" id="alert-count">0</span>
+      </div>
+      <div class="alert-list" id="alert-list"></div>
+    </div>
     <div class="panel-header">
       <span>이벤트 로그</span>
       <span class="count" id="event-count">0</span>
@@ -1619,6 +1927,24 @@ function rebuildGrid() {
       const s = streamList.find(x=>x.id===slot.streamId);
       cell.innerHTML += '<div class="overlay"><span class="live-badge"><span class="live-dot"></span>LIVE</span><span class="vname">'+(s?s.label:slot.streamId)+'</span><span class="vinfo">'+(s?s.resolution+' '+s.videoCodec:'')+'</span></div>';
       cell.innerHTML += '<div class="cell-controls"><button class="cell-btn" onclick="event.stopPropagation();captureSnapshot('+i+')" title="스냅샷">&#x1F4F7;</button><button class="cell-btn" onclick="event.stopPropagation();fullscreenCell('+i+')" title="전체화면">&#x26F6;</button><button class="cell-btn" onclick="event.stopPropagation();removeFromGrid('+i+')" title="제거">&#x2715;</button></div>';
+      // PTZ controls
+      const streamCfg = streamList.find(x=>x.id===slot.streamId);
+      if (streamCfg && streamCfg.type === 'rtsp') {
+        cell.innerHTML += '<div class="ptz-overlay"><div class="ptz-pad">'
+          + '<button class="ptz-btn ptz-up" onclick="event.stopPropagation();ptzMove(\\''+slot.streamId+'\\',0,0.3)">&#x25B2;</button>'
+          + '<button class="ptz-btn ptz-down" onclick="event.stopPropagation();ptzMove(\\''+slot.streamId+'\\',0,-0.3)">&#x25BC;</button>'
+          + '<button class="ptz-btn ptz-left" onclick="event.stopPropagation();ptzMove(\\''+slot.streamId+'\\',-0.3,0)">&#x25C0;</button>'
+          + '<button class="ptz-btn ptz-right" onclick="event.stopPropagation();ptzMove(\\''+slot.streamId+'\\',0.3,0)">&#x25B6;</button>'
+          + '<button class="ptz-btn ptz-center" onclick="event.stopPropagation();ptzStop(\\''+slot.streamId+'\\')">&#x25CF;</button>'
+          + '</div>'
+          + '<div class="ptz-zoom"><button class="ptz-zoom-btn" onclick="event.stopPropagation();ptzZoom(\\''+slot.streamId+'\\',0.5)">+</button><button class="ptz-zoom-btn" onclick="event.stopPropagation();ptzZoom(\\''+slot.streamId+'\\',-0.5)">-</button></div>'
+          + '<div class="ptz-presets">'
+          + '<button class="ptz-preset-btn" onclick="event.stopPropagation();ptzPreset(\\''+slot.streamId+'\\',1)">P1</button>'
+          + '<button class="ptz-preset-btn" onclick="event.stopPropagation();ptzPreset(\\''+slot.streamId+'\\',2)">P2</button>'
+          + '<button class="ptz-preset-btn" onclick="event.stopPropagation();ptzPreset(\\''+slot.streamId+'\\',3)">P3</button>'
+          + '<button class="ptz-preset-btn" onclick="event.stopPropagation();ptzPreset(\\''+slot.streamId+'\\',4)">P4</button>'
+          + '</div></div>';
+      }
     } else {
       gridSlots[i] = { streamId: null, videoEl: null, mediaStream: null };
       cell.innerHTML = '<div class="empty-label"><div class="num">' + (i+1) + '</div>영상 소스를 선택하세요</div>';
@@ -1779,7 +2105,7 @@ function renderEvents() {
     const e = events[i];
     const div = document.createElement('div');
     div.className = 'event-item' + (i === 0 && isNew ? ' new' : '');
-    const iconMap = { stream:'S', recording:'R', client:'C', system:'I' };
+    const iconMap = { stream:'S', recording:'R', client:'C', system:'I', dispatch:'!' };
     const t = new Date(e.time);
     const timeStr = String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0');
     div.innerHTML = '<div class="event-icon '+(e.type||'system')+'">'+(iconMap[e.type]||'I')+'</div>'
@@ -1864,6 +2190,33 @@ ws.onmessage = async (event) => {
       addLocalEvent(msg.event.type, msg.event.message);
       break;
     }
+    case 'newAlert': {
+      alerts.unshift(msg.alert);
+      renderAlerts();
+      addLocalEvent('dispatch', '[' + msg.alert.typeLabel + '] ' + msg.alert.location);
+      // Audio alert for critical
+      if (msg.alert.severity === 'critical') {
+        try { new AudioContext().resume().then(() => {
+          const ctx = new AudioContext();
+          const osc = ctx.createOscillator(); const gain = ctx.createGain();
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.frequency.value = 880; gain.gain.value = 0.3;
+          osc.start(); osc.stop(ctx.currentTime + 0.3);
+          setTimeout(() => { const o2 = ctx.createOscillator(); o2.connect(gain); o2.frequency.value = 1100; o2.start(); o2.stop(ctx.currentTime + 0.3); }, 400);
+        }); } catch {}
+      }
+      break;
+    }
+    case 'alertUpdated': {
+      const idx = alerts.findIndex(a => a.id === msg.alert.id);
+      if (idx >= 0) alerts[idx] = msg.alert; else alerts.unshift(msg.alert);
+      renderAlerts();
+      break;
+    }
+    case 'ptzState': {
+      // Could display PTZ position indicator on the video cell
+      break;
+    }
   }
 };
 
@@ -1916,6 +2269,72 @@ function setMiniBar(id, pct) {
 updateStatusBar();
 setInterval(updateStatusBar, 3000);
 
+// ═══ PTZ Control Functions ═══
+function ptzMove(streamId, pan, tilt) {
+  ws.send(JSON.stringify({ action: 'ptzMove', streamId, pan, tilt, speed: 0.5 }));
+}
+function ptzZoom(streamId, zoom) {
+  ws.send(JSON.stringify({ action: 'ptzZoom', streamId, zoom, speed: 0.5 }));
+}
+function ptzStop(streamId) {
+  ws.send(JSON.stringify({ action: 'ptzStop', streamId }));
+}
+function ptzPreset(streamId, preset, save) {
+  ws.send(JSON.stringify({ action: 'ptzPreset', streamId, preset, save: !!save }));
+}
+
+// ═══ 119 Alert System ═══
+const alerts = [];
+
+function renderAlerts() {
+  const container = document.getElementById('alert-list');
+  container.innerHTML = '';
+  document.getElementById('alert-count').textContent = alerts.filter(a => a.status !== '상황종료' && a.status !== '복귀').length;
+  for (const a of alerts.slice(0, 30)) {
+    const div = document.createElement('div');
+    const sevClass = 'severity-' + a.severity;
+    const unackClass = !a.acknowledged ? ' unack' : '';
+    div.className = 'alert-item ' + sevClass + unackClass;
+    const statusActive = (a.status !== '상황종료' && a.status !== '복귀') ? ' active' : '';
+    div.innerHTML = '<span class="alert-type ' + (a.type||'') + '">' + (a.typeLabel||a.type) + '</span>'
+      + '<div class="alert-body"><div class="alert-loc">' + a.location + '</div>'
+      + '<div class="alert-detail">' + (a.detail||'') + '</div></div>'
+      + '<span class="alert-status' + statusActive + '">' + a.status + '</span>'
+      + (!a.acknowledged ? '<button class="alert-ack-btn" onclick="event.stopPropagation();ackAlert(\\'' + a.id + '\\')">확인</button>' : '');
+    div.addEventListener('click', () => showAlertDetail(a));
+    container.appendChild(div);
+  }
+}
+
+function ackAlert(alertId) {
+  ws.send(JSON.stringify({ action: 'acknowledgeAlert', alertId }));
+  const a = alerts.find(x => x.id === alertId);
+  if (a) { a.acknowledged = true; renderAlerts(); }
+}
+
+function showAlertDetail(alert) {
+  const statusOptions = ['접수','출동','현장도착','진행중','상황종료','복귀'];
+  const nextIdx = statusOptions.indexOf(alert.status) + 1;
+  if (nextIdx < statusOptions.length) {
+    const next = statusOptions[nextIdx];
+    if (confirm('[' + alert.typeLabel + '] ' + alert.location + '\\n현재: ' + alert.status + '\\n→ ' + next + ' 로 변경하시겠습니까?')) {
+      ws.send(JSON.stringify({ action: 'updateAlertStatus', alertId: alert.id, status: next }));
+      alert.status = next;
+      renderAlerts();
+    }
+  }
+  // If alert has streamId, focus on that camera
+  if (alert.streamId && !watchingStreams.has(alert.streamId)) {
+    addToGrid(alert.streamId);
+  }
+}
+
+// Load initial alerts
+fetch('/api/alerts').then(r=>r.json()).then(list => {
+  alerts.push(...list);
+  renderAlerts();
+}).catch(()=>{});
+
 // ═══ Keyboard Shortcuts ═══
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -1934,6 +2353,17 @@ document.addEventListener('keydown', (e) => {
     const next = layouts[(layouts.indexOf(currentLayout)+1) % layouts.length];
     document.querySelectorAll('.layout-btn').forEach(b => b.classList.toggle('active', b.dataset.layout === next));
     setLayout(next);
+  }
+  // PTZ arrow key control for focused cell
+  if (focusedSlot >= 0 && gridSlots[focusedSlot]?.streamId) {
+    const sid = gridSlots[focusedSlot].streamId;
+    if (e.key === 'ArrowUp') { e.preventDefault(); ptzMove(sid, 0, 0.3); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); ptzMove(sid, 0, -0.3); }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); ptzMove(sid, -0.3, 0); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); ptzMove(sid, 0.3, 0); }
+    if (e.key === '+' || e.key === '=') { e.preventDefault(); ptzZoom(sid, 0.5); }
+    if (e.key === '-') { e.preventDefault(); ptzZoom(sid, -0.5); }
+    if (e.key === ' ') { e.preventDefault(); ptzStop(sid); }
   }
 });
 
